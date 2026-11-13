@@ -1,0 +1,9 @@
+# Whitelist: only what the harness needs at run time goes into the build context.
+*
+!requirements.txt
+!constraints.txt
+!run_agent.py
+!src/
+!src/**
+**/__pycache__
+**/*.pyc

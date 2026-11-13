@@ -1,0 +1,117 @@
+name: ci
+
+# Checks that the last commit really works the way the organisers will run it:
+# unit tests, the public examples, a synthetic task set, a clean Docker build
+# (time and size limits) and the exact `docker run` command from the rules on an
+# isolated network with a mock LLM proxy. No secrets are needed.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Unit tests and audit regressions
+        run: python -m unittest discover -s tests -v
+      - name: Public examples (no LLM, must be 8/8 with zero tokens)
+        run: python tests/score_local.py task-dir --quiet
+      - name: Synthetic set (wordings + infeasible tasks)
+        run: |
+          python tests/gen_synthetic.py --seed 7
+          python tests/score_local.py tests/synthetic_tasks --quiet --only-failures
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build from scratch (limit 1000 s, size limit 4 GB)
+        run: |
+          start=$(date +%s)
+          timeout 1000s docker build --no-cache -t hack:latest .
+          echo "build seconds: $(( $(date +%s) - start ))"
+          docker images --format "{{.Repository}}:{{.Tag}} -> {{.Size}}" | grep '^hack:latest'
+          size=$(docker image inspect hack:latest --format '{{.Size}}')
+          echo "image bytes: $size"
+          test "$size" -lt 4000000000
+
+      - name: Isolated network with a mock LLM proxy
+        run: |
+          docker network create --internal hack-net
+          docker run -d --name mock-proxy --network hack-net -v "$PWD/tests:/t:ro" \
+            python:3.11.9-slim-bookworm python /t/mock_llm_server.py --host 0.0.0.0 --port 8000
+          sleep 3
+          docker logs mock-proxy
+
+      - name: Run with the command from the rules (zero-token path)
+        run: |
+          export TASKS="$RUNNER_TEMP/tasks_a" RESULTS="$RUNNER_TEMP/results_a"
+          # The task directories must be writable for uid 0 without CAP_DAC_OVERRIDE (see README).
+          cp -r task-dir "$TASKS" && chmod -R a+rwX "$TASKS"
+          mkdir -p "$RESULTS" && chmod 777 "$RESULTS"
+          export LLM_BASE_URL=http://mock-proxy:8000/v1 LLM_API_KEY=mock-key
+          # GitHub runners have fewer than 8 cores, so --cpus is the only flag that differs.
+          timeout -k 1000s 1h docker run --rm --name "run-ci" \
+            --network hack-net \
+            -e LLM_BASE_URL -e LLM_API_KEY \
+            -v "$TASKS:/data/tasks:rw" -v "$RESULTS:/audit:rw" \
+            --read-only --tmpfs /tmp:rw,size=2g -e HOME=/tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --cpus "$(nproc)" --memory 16g --pids-limit 512 \
+            --workdir /app --entrypoint python \
+            "hack:latest" \
+            /app/run_agent.py --tasks-dir /data/tasks --trace /audit/trace.jsonl | tee run_a.log
+          grep "child process isolation" run_a.log
+          python3 tests/score_local.py "$TASKS" --no-run --trace "$RESULTS/trace.jsonl" --original task-dir
+          grep -q '"event": "llm_call"' "$RESULTS/trace.jsonl" && { echo "unexpected LLM call on the free path"; exit 1; } || true
+
+      - name: Run again with the LLM tier forced (openJiuwen -> mock proxy)
+        run: |
+          export TASKS="$RUNNER_TEMP/tasks_b" RESULTS="$RUNNER_TEMP/results_b"
+          cp -r task-dir "$TASKS" && chmod -R a+rwX "$TASKS"
+          mkdir -p "$RESULTS" && chmod 777 "$RESULTS"
+          export LLM_BASE_URL=http://mock-proxy:8000/v1 LLM_API_KEY=mock-key HARNESS_MUTATION_REPAIR=0
+          timeout -k 1000s 1h docker run --rm --name "run-ci" \
+            --network hack-net \
+            -e LLM_BASE_URL -e LLM_API_KEY -e HARNESS_MUTATION_REPAIR \
+            -v "$TASKS:/data/tasks:rw" -v "$RESULTS:/audit:rw" \
+            --read-only --tmpfs /tmp:rw,size=2g -e HOME=/tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --cpus "$(nproc)" --memory 16g --pids-limit 512 \
+            --workdir /app --entrypoint python \
+            "hack:latest" \
+            /app/run_agent.py --tasks-dir /data/tasks --trace /audit/trace.jsonl | tee run_b.log
+          grep -q "'llm': 2" run_b.log
+          grep -q '"transport": "openjiuwen"' "$RESULTS/trace.jsonl"
+          python3 tests/score_local.py "$TASKS" --no-run --trace "$RESULTS/trace.jsonl" --original task-dir
+
+      - name: Task directories that uid 0 without capabilities cannot write to (clean refusal, no fake success)
+        run: |
+          export TASKS="$RUNNER_TEMP/tasks_c"
+          cp -r task-dir "$TASKS" && chmod -R go-w "$TASKS"
+          export LLM_BASE_URL=http://mock-proxy:8000/v1 LLM_API_KEY=mock-key
+          docker run --rm --network hack-net -e LLM_BASE_URL -e LLM_API_KEY \
+            -v "$TASKS:/data/tasks:rw" --read-only --tmpfs /tmp:rw,size=2g -e HOME=/tmp \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 \
+            --workdir /app --entrypoint python hack:latest /app/run_agent.py --tasks-dir /data/tasks | tee run_c.log
+          test "$(find "$TASKS" -name answer.txt | wc -l)" = "0"
+          grep -q "NOT writable" run_c.log
+          grep -q "answered=0/8" run_c.log
+
+      - name: No outbound network at run time
+        run: |
+          if docker run --rm --network hack-net --entrypoint python hack:latest -c \
+            "import urllib.request; urllib.request.urlopen('https://pypi.org', timeout=8)"; then
+            echo "unexpected: internet reachable from hack-net"; exit 1
+          else
+            echo "ok: no internet from the isolated network"
+          fi

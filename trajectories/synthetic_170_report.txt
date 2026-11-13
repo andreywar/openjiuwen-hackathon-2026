@@ -1,0 +1,32 @@
+Synthetic set: python tests/gen_synthetic.py --seed 7 (170 tasks: 131 feasible, 39 infeasible).
+Run inside the Docker image (free path): --network none, HARNESS_LLM=0, HARNESS_WORKERS=4,
+--cpus 4 --memory 6g, read-only root, --cap-drop ALL. Scored by tests/score_local.py with the trace.
+UNSOLVED_ROUTED_TO_LLM / INFEASIBLE_TO_LLM = not solved here; the task would be handed to the LLM tier.
+
+container exit code: 0 wall seconds: 164
+2026-11-13 13:06:35,714 INFO harness: child process isolation: landlock abi 1 + audit hook (network: hook only)
+2026-11-13 13:09:15,207 INFO harness: phase 1 done in 159.5s: solved=126 infeasible=35 need_llm=9
+2026-11-13 13:09:15,218 INFO harness: SUMMARY answered=126/170 reward=374/505 infeasible=35 unsolved=9 tiers={'deterministic': 73, 'mutation': 53, 'llm': 0}
+2026-11-13 13:09:15,218 INFO harness: TOKENS spent=0.0 of budget 170000 (soft limit 144500): calls=0 input=0 output=0 reasoning=0
+2026-11-13 13:09:15,218 INFO harness: elapsed 159.5s
+--------------------------------------------------------------------------------------------------------------
+  coding         INFEASIBLE_TO_LLM          1
+  coding         OK_FREE                    54
+  coding         REJECT_FREE                7
+  coding         UNSOLVED_ROUTED_TO_LLM     2
+  data_analysis  INFEASIBLE_ANSWERED_FREE   1
+  data_analysis  INFEASIBLE_TO_LLM          1
+  data_analysis  OK_FREE                    24
+  data_analysis  REJECT_FREE                5
+  data_analysis  UNSOLVED_ROUTED_TO_LLM     1
+  math           INFEASIBLE_TO_LLM          1
+  math           OK_FREE                    24
+  math           REJECT_FREE                5
+  math           UNSOLVED_ROUTED_TO_LLM     2
+  search         OK_FREE                    23
+  search         REJECT_FREE                18
+  search         UNSOLVED_ROUTED_TO_LLM     1
+CORRECTNESS feasible: 125/131 correct, reward 373/389 | wrong answers: 0 | false rejects: 0 | unsolved: 6 (of them routed to the LLM tier: 6)
+ROUTING     infeasible: 39 tasks | rejected free: 35 | sent to the LLM tier: 3 | answered free: 1 | no answer: 0
+SPEND       total tokens: 0.0 in 0 LLM call(s) | on infeasible tasks: 0.0
+harness exit code 0 | 0.0s | cases to check: 0
