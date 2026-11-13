@@ -99,13 +99,44 @@ _FUNC_CASE_RX = re.compile(r"unittest\.case\.FunctionTestCase \((\w+)\)")
 _RAN_RX = re.compile(r"^Ran (\d+) tests? in ", re.M)
 
 # Runner for files with plain ``def test_x():`` functions (optionally next to
-# TestCase classes). Functions that need arguments (pytest fixtures) cannot be
-# executed without pytest; that is reported instead of being silently skipped.
+# TestCase classes) and for files with ``async def`` tests.
+# * Functions that need arguments (pytest fixtures) cannot be executed without
+#   pytest; that is reported instead of being silently skipped.
+# * ``async def test_x()`` at module level is really awaited (``asyncio.run``):
+#   unittest.FunctionTestCase would only create the coroutine and report OK.
+# * An ``async def`` test method is executed by unittest only inside
+#   ``IsolatedAsyncioTestCase``. In any other class its body would never run, so
+#   the file is reported as unsupported instead of being counted as passed.
 _FUNCTION_RUNNER = r'''
-import importlib, inspect, sys, unittest
+import asyncio, functools, importlib, inspect, sys, unittest
 mod = importlib.import_module(sys.argv[1])
 suite = unittest.TestSuite()
 suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(mod))
+
+def flat(s):
+    for t in s:
+        if isinstance(t, unittest.TestSuite):
+            yield from flat(t)
+        else:
+            yield t
+
+not_awaited = []
+for t in flat(suite):
+    method = getattr(t, getattr(t, "_testMethodName", ""), None)
+    if method is not None and inspect.iscoroutinefunction(method) \
+            and not isinstance(t, unittest.IsolatedAsyncioTestCase):
+        not_awaited.append(t.id())
+if not_awaited:
+    sys.stderr.write("UNSUPPORTED: async test methods outside IsolatedAsyncioTestCase would not be awaited: %s\n"
+                     % ", ".join(not_awaited))
+    sys.exit(3)
+
+def awaited(fn):
+    @functools.wraps(fn)
+    def run():
+        return asyncio.run(fn())
+    return run
+
 needs_args = []
 for name, fn in sorted(vars(mod).items()):
     if name.startswith("test") and inspect.isfunction(fn) and fn.__module__ == mod.__name__:
@@ -113,6 +144,8 @@ for name, fn in sorted(vars(mod).items()):
                     if p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
         if required:
             needs_args.append(name)
+        elif inspect.iscoroutinefunction(fn):
+            suite.addTest(unittest.FunctionTestCase(awaited(fn)))
         else:
             suite.addTest(unittest.FunctionTestCase(fn))
 if needs_args:
@@ -127,20 +160,24 @@ def test_layout(source: str) -> Tuple[str, int]:
     """(runner kind, number of statically visible tests) of a test file.
 
     kind: ``unittest`` (test methods in classes), ``functions`` (top-level
-    ``test_*`` functions, possibly with classes) or ``none``.
+    ``test_*`` functions, possibly with classes, or any ``async def`` test - these
+    go through the harness' own runner, which knows what is really awaited) or
+    ``none``.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return "none", 0
-    methods = functions = 0
+    methods = functions = async_methods = 0
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
-            methods += sum(1 for s in node.body
-                           if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name.startswith("test"))
+            tests = [s for s in node.body
+                     if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name.startswith("test")]
+            methods += len(tests)
+            async_methods += sum(1 for s in tests if isinstance(s, ast.AsyncFunctionDef))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
             functions += 1
-    if functions:
+    if functions or async_methods:
         return "functions", methods + functions
     if methods:
         return "unittest", methods
@@ -1084,9 +1121,18 @@ async def _llm_repair(task, ctx: CodingContext, llm, settings, trace, pool: "Scr
             (settings.model_strong, min(2000, allowance + 400))]
     last_reason = "no attempt made"
     for attempt, (model, wanted) in enumerate(plan, 1):
-        max_tokens = llm.affordable_max_tokens(task.task_id, messages, wanted, minimum=max(120, int(wanted * 0.5)))
+        adm = llm.admission(task.task_id, messages, wanted, minimum=max(120, int(wanted * 0.5)))
+        max_tokens = adm["allowed"]
         if max_tokens <= 0:
-            last_reason = "attempt %d does not fit into the per-task token cap" % attempt
+            # Postponed for lack of budget - this says nothing about feasibility.
+            progress = "failing tests %d -> %d" % (len(ctx.baseline.failing) if ctx.baseline else -1, len(run.failing))
+            last_reason = ("attempt %d not started: %s (task spent %s of cap %s%s, free global budget %s, "
+                           "input %s, wanted %d, minimum %d; %s)" % (
+                               attempt, adm["limit"], adm["task_spent"], adm["task_cap"],
+                               " set by HARNESS_TASK_CAP" if adm["task_cap_explicit"] else "", adm["global_free"],
+                               adm["input_cost"], adm["wanted"], adm["minimum"], progress))
+            if trace:
+                trace.event(task.task_id, "attempt_denied", attempt=attempt, progress=progress, **adm)
             break
         try:
             reply = await llm.chat(task.task_id, messages, model=model, max_tokens=max_tokens,

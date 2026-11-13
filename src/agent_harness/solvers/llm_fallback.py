@@ -120,9 +120,14 @@ async def _loop(task, llm, settings, scratch: str, trace) -> Outcome:
         strong = step == MAX_STEPS
         model = settings.model_strong if strong else settings.model_fast
         # every step must fit into what is left of the per-task cap
-        max_tokens = llm.affordable_max_tokens(task.task_id, messages, 700 if strong else 320, minimum=120)
+        adm = llm.admission(task.task_id, messages, 700 if strong else 320, minimum=120)
+        max_tokens = adm["allowed"]
         if max_tokens <= 0:
-            return Outcome.unknown("budget: step %d does not fit into the token cap" % step)
+            if trace:
+                trace.event(task.task_id, "attempt_denied", attempt=step, **adm)
+            return Outcome.unknown("budget: step %d not started: %s (task spent %s of cap %s, free global budget %s, "
+                                   "input %s)" % (step, adm["limit"], adm["task_spent"], adm["task_cap"],
+                                                  adm["global_free"], adm["input_cost"]))
         try:
             reply = await llm.chat(task.task_id, messages, model=model, max_tokens=max_tokens,
                                    purpose="fallback_step_%d" % step)

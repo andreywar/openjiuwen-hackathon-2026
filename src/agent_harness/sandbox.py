@@ -205,7 +205,8 @@ def isolation_mode() -> str:
                 if "landlock_abi=" in text:
                     abi = int(text.split("landlock_abi=")[1].split()[0])
                     if abi > 0:
-                        mode = "landlock abi %d + audit hook%s" % (abi, "" if abi >= 4 else " (network: hook only)")
+                        mode = "landlock abi %d + audit hook%s" % (
+                            abi, "" if abi >= 4 else " (network is NOT restricted by the kernel)")
             finally:
                 shutil.rmtree(d, ignore_errors=True)
         except Exception:

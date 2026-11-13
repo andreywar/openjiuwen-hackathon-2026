@@ -90,6 +90,18 @@ class Ledger:
             self.per_task[rec.task_id] = self.per_task.get(rec.task_id, 0.0) + rec.cost
             self.calls.append(rec)
 
+    def settle(self, reserved_amount: float, rec: CallRecord) -> None:
+        """End one reserved attempt: drop its reservation and book its cost in one step.
+
+        The real cost may be larger than the reservation (the estimate is not an
+        upper bound); it is booked as it is, and later admissions see it.
+        """
+        with self._lock:
+            self.reserved = max(0.0, self.reserved - reserved_amount)
+            self.spent += rec.cost
+            self.per_task[rec.task_id] = self.per_task.get(rec.task_id, 0.0) + rec.cost
+            self.calls.append(rec)
+
     def summary(self) -> dict:
         with self._lock:
             by_model: Dict[str, dict] = {}

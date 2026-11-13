@@ -27,12 +27,18 @@ Error policy (see ``classify``):
   back-off and jitter, ``Retry-After`` is honoured, the delay is shared by all
   parallel sessions and never runs past the deadline of the run. After a
   logical call has failed completely the client cools down and then recovers;
-  it is not switched off for the rest of the run. A 429 alone is not taken as
-  proof that the budget is exhausted; only an explicit budget/quota message
-  (or 402) repeated twice stops the LLM work;
+  it is not switched off for the rest of the run. A 429 is a rate limit unless
+  it says unambiguously that the total budget is exhausted and carries nothing
+  that points to a temporary limit (no Retry-After, no "rate limit" / "per
+  minute" wording); only such a message (or 402) seen twice in a row stops the
+  LLM work;
 * time-out or a lost answer after the request was sent - the proxy may have
   generated (and billed) the completion: the reserved estimate is booked as
   *uncertain* spend and the request is repeated at most once.
+
+Every attempt, including a retry, is admitted separately against the per-task
+cap and the global soft limit and settles its own reservation; a retry that no
+longer fits the budget is not sent.
 
 TLS certificates are always verified against the system / certifi CA bundle;
 there is no fallback to an unverified connection.
@@ -106,8 +112,21 @@ class Failure:
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
-_BUDGET_WORDS = re.compile(r"budget|quota|insufficient|exhaust|token limit|limit (?:reached|exceeded)|out of tokens",
-                           re.I)
+# An unambiguous statement that the *total* allowance is used up. Rate limits
+# ("limit exceeded", "tokens per minute quota") are deliberately not matched.
+_BUDGET_WORDS = re.compile(
+    r"insufficient[_ ](?:quota|balance|funds|credits?|budget)"
+    r"|budget (?:is |has been |was )?(?:exhausted|exceeded|spent|used up|depleted)"
+    r"|(?:exhausted|exceeded|spent|used up) (?:the |your |its |total |token )*budget"
+    r"|budget limit (?:reached|exceeded)"
+    r"|out of (?:tokens|budget|credits?)"
+    r"|(?:exceeded|exhausted) your (?:current )?quota"
+    r"|no (?:remaining |more )?(?:budget|credits?)(?: left)?\b", re.I)
+# Signs of a temporary limit. If any is present the refusal is treated as
+# temporary even when budget-like words appear next to it.
+_RATE_WORDS = re.compile(
+    r"rate.?limit|per[ -](?:second|minute|hour|day)|\b[rt]pm\b|\b[rt]pd\b|retry|try again"
+    r"|slow down|temporar|throttl|overload|concurren|please wait", re.I)
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -126,7 +145,7 @@ def _chain(exc: BaseException):
     while cur is not None and cur not in seen and len(seen) < 8:
         seen.append(cur)
         yield cur
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__ or (None if cur.__suppress_context__ else cur.__context__)
 
 
 def _retry_after(headers) -> Optional[float]:
@@ -164,7 +183,15 @@ def classify(exc: BaseException) -> Failure:
         if m:
             status = int(m.group(1))
     if status is not None:
-        if status == 402 or (status in (403, 429) and _BUDGET_WORDS.search(blob)):
+        # Exhaustion of the total budget must be stated unambiguously: 402, or an
+        # explicit budget message with nothing that points to a temporary limit
+        # (no Retry-After, no rate-limit wording). Everything else on 429 is a
+        # rate limit and is retried; the contract of the proxy is not guessed.
+        # Only what the proxy said counts: class names such as "RateLimitError" (every
+        # 429 of the OpenAI client) and the standard reason phrase carry no information.
+        said = re.sub(r"\b\w+(?:Error|Exception)\b|too many requests", " ", " ".join(texts), flags=re.I)
+        if status == 402 or (status in (403, 429) and retry_after is None and _BUDGET_WORDS.search(said)
+                             and not _RATE_WORDS.search(said)):
             return Failure("budget", status, retry_after, text, False)
         if status in (401, 403):
             return Failure("auth", status, retry_after, text, False)
@@ -206,6 +233,9 @@ class LLMClient:
         self._oj_failures = 0
         self.transport_counts = {"openjiuwen": 0, "http": 0}
         self.retries = 0
+        # Tasks of the paid queue that have not had their first attempt yet
+        # (maintained by the pipeline); they keep their share of the free budget.
+        self.waiting_tasks = 0
         self._ssl_context: Optional[ssl.SSLContext] = None
 
     # ------------------------------------------------------------------ utils
@@ -248,12 +278,45 @@ class LLMClient:
         prompt_text = "".join(str(m.get("content", "")) for m in messages)
         return (estimate_tokens(prompt_text) + 8 * len(messages)) * 0.1 + max_tokens
 
+    def task_cap(self, task_id: str) -> float:
+        """What this task may have consumed in total after its next call.
+
+        An explicit HARNESS_TASK_CAP is a hard cap. Otherwise the configured
+        value (1800) is the floor, and the task may go on beyond it as long as
+        it stays within its equal share of the budget that is free right now,
+        the other shares belonging to the queued tasks that are still waiting
+        for their first attempt. So one hard task cannot take what the others
+        need for a first try, but the last promising task is not stopped at
+        1800 while thousands of tokens are free. The global soft limit and the
+        three logical attempts per task stay in force either way.
+        """
+        if self.s.task_cap_explicit:
+            return self.s.task_token_cap
+        spent = self.ledger.task_spent(task_id)
+        share = spent + max(0.0, self.ledger.remaining()) / (max(0, self.waiting_tasks) + 1)
+        return max(self.s.task_token_cap, share)
+
+    def admission(self, task_id: str, messages: List[dict], wanted: int, minimum: int = 64) -> dict:
+        """Can a call with up to ``wanted`` output tokens be made now, and if not - why exactly."""
+        fixed = self.estimate_call(messages, 0)
+        spent = self.ledger.task_spent(task_id)
+        cap = self.task_cap(task_id)
+        task_room = cap - spent - fixed
+        global_free = self.ledger.remaining()
+        global_room = global_free - fixed
+        allowed = int(min(wanted, task_room, global_room))
+        limit = ""
+        if allowed < minimum:
+            allowed = 0
+            limit = "global budget" if global_room < task_room else "per-task cap"
+        return {"allowed": allowed, "limit": limit, "wanted": int(wanted), "minimum": int(minimum),
+                "input_cost": round(fixed, 1), "task_spent": round(spent, 1), "task_cap": round(cap, 1),
+                "task_cap_explicit": bool(self.s.task_cap_explicit), "global_free": round(global_free, 1),
+                "reserved": round(self.ledger.reserved, 1), "waiting_tasks": self.waiting_tasks}
+
     def affordable_max_tokens(self, task_id: str, messages: List[dict], wanted: int, minimum: int = 64) -> int:
         """Largest ``max_tokens`` <= ``wanted`` that fits the per-task cap and the global soft limit (0 = none)."""
-        fixed = self.estimate_call(messages, 0)
-        room = min(self.s.task_token_cap - self.ledger.task_spent(task_id), self.ledger.remaining()) - fixed
-        allowed = int(min(wanted, room))
-        return allowed if allowed >= minimum else 0
+        return self.admission(task_id, messages, wanted, minimum)["allowed"]
 
     # ----------------------------------------------------------- openJiuwen
     def _get_oj_model(self, model: str):
@@ -348,17 +411,22 @@ class LLMClient:
         prompt_text = "".join(str(m.get("content", "")) for m in messages)
         est_in = estimate_tokens(prompt_text) + 8 * len(messages)
         est = est_in * 0.1 + max_tokens
-        if self.ledger.task_spent(task_id) + est > self.s.task_token_cap:
-            raise BudgetExceeded("per-task cap")
-        if not self.ledger.try_reserve(est):
-            raise BudgetExceeded("global soft limit")
 
+        # Every attempt that may be billed has its own life cycle:
+        #   admit (per-task cap + atomic reservation in the ledger)
+        #   -> send
+        #   -> settle: the reservation is dropped and exactly one cost is booked -
+        #      the reported usage, or the reserved estimate when the answer was lost
+        #      after sending ("uncertain spend"); an attempt the proxy certainly did
+        #      not serve just releases its reservation.
+        # A retry is a new attempt and must be admitted again, whatever the transport.
         reply: Optional[Reply] = None
         errors: List[str] = []
         attempts = 0
         timeouts = 0
         use_http_next = False
-        in_flight = False
+        denied = ""          # why an attempt was not admitted
+        holding = False      # a reservation of ``est`` is currently held
         try:
             while attempts < self.MAX_ATTEMPTS:
                 await self._wait_gate()
@@ -368,25 +436,32 @@ class LLMClient:
                 if left < 20:
                     errors.append("deadline reached")
                     break
+                if self.ledger.task_spent(task_id) + est > self.task_cap(task_id):
+                    denied = "per-task cap"
+                    break
+                if not self.ledger.try_reserve(est):
+                    denied = "global soft limit"
+                    break
+                holding = True
                 timeout = max(10.0, min(self.s.llm_timeout_s, left - 10))
                 transport = "http" if (self._oj_ok is False or use_http_next) else "openjiuwen"
                 use_http_next = False
                 attempts += 1
                 try:
-                    in_flight = True
                     reply = await self._send(transport, messages, model, max_tokens, timeout)
-                    in_flight = False
                     if transport == "openjiuwen":
                         self._oj_ok = True
                     break
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    in_flight = False
                     f = classify(e)
                     errors.append("%s -> %s [%s]" % (transport, f.text, f.kind))
+                    holding = False
                     if f.maybe_paid:
-                        self._book_uncertain(task_id, model, purpose, est, transport, f)
+                        self._settle_uncertain(task_id, model, purpose, est, transport, f)
+                    else:
+                        self.ledger.release(est)
                     if f.kind == "auth":
                         self._stop("the proxy rejected the key (HTTP %s)" % f.status)
                         break
@@ -423,30 +498,40 @@ class LLMClient:
                         break
                     self.retries += 1
                     self._hold(delay)
+            if reply is not None:
+                self._finalise_usage(reply, est_in)
+                holding = False
+                self.ledger.settle(est, CallRecord(task_id, model, purpose, reply.input_tokens, reply.output_tokens,
+                                                   reply.reasoning_tokens, reply.cost, reply.transport,
+                                                   reply.usage_note))
         except asyncio.CancelledError:
-            if in_flight:  # cancelled at the deadline with a request on the wire
-                self._book_uncertain(task_id, model, purpose, est, "cancelled",
-                                     Failure("timeout", None, None, "cancelled while waiting for the answer", True))
+            if holding:  # cancelled with a request on the wire: it may still be served and billed
+                holding = False
+                self._settle_uncertain(task_id, model, purpose, est, "cancelled",
+                                       Failure("timeout", None, None, "cancelled while waiting for the answer", True))
             raise
         finally:
-            self.ledger.release(est)
+            if holding:
+                self.ledger.release(est)
 
         if reply is None:
-            self._consecutive_failures += 1
-            if not self.dead:
-                # cool down and recover later instead of switching the LLM off for good
-                self._hold(min(self.COOLDOWN_CAP_S, 15.0 * (2 ** (self._consecutive_failures - 1))))
-            if self.trace:
+            if errors:
+                self._consecutive_failures += 1
+                if not self.dead and not denied:
+                    # cool down and recover later instead of switching the LLM off for good
+                    self._hold(min(self.COOLDOWN_CAP_S, 15.0 * (2 ** (self._consecutive_failures - 1))))
+            if self.trace and (errors or attempts):
                 self.trace.event(task_id, "llm_error", purpose=purpose, model=model, errors=errors,
-                                 attempts=attempts, stopped=self.dead)
+                                 attempts=attempts, stopped=self.dead, denied=denied)
+            if denied:
+                # first attempt: plain refusal; later: the retry itself is not affordable any more
+                raise BudgetExceeded(denied if not attempts else "%s: no budget left to retry after %s" % (
+                    denied, errors[-1][:120] if errors else "a failed attempt"))
             raise LLMUnavailable("; ".join(errors) or "no response")
 
         self._consecutive_failures = 0
         self._budget_signals = 0
-        self._finalise_usage(reply, est_in)
         self.transport_counts[reply.transport] = self.transport_counts.get(reply.transport, 0) + 1
-        self.ledger.charge(CallRecord(task_id, model, purpose, reply.input_tokens, reply.output_tokens,
-                                      reply.reasoning_tokens, reply.cost, reply.transport, reply.usage_note))
         if self.trace:
             self.trace.event(
                 task_id, "llm_call", purpose=purpose, model=model, transport=reply.transport,
@@ -474,11 +559,13 @@ class LLMClient:
                                    reasoning_separate=bool(separate))
         reply.usage_note = "; ".join(notes)
 
-    def _book_uncertain(self, task_id: str, model: str, purpose: str, est: float, transport: str,
-                        f: Failure) -> None:
-        """A request may have been served and billed although no answer arrived."""
-        self.ledger.charge(CallRecord(task_id, model, purpose, 0, 0, 0, est, transport,
-                                      "uncertain spend: no answer received (%s), reserved estimate booked" % f.kind))
+    def _settle_uncertain(self, task_id: str, model: str, purpose: str, est: float, transport: str,
+                          f: Failure) -> None:
+        """End an attempt that may have been served and billed although no answer arrived:
+        its reservation becomes booked spend (once)."""
+        self.ledger.settle(est, CallRecord(
+            task_id, model, purpose, 0, 0, 0, est, transport,
+            "uncertain spend: no answer received (%s), reserved estimate booked" % f.kind))
         if self.trace:
             self.trace.event(task_id, "llm_uncertain_spend", purpose=purpose, model=model, booked=round(est, 1),
                              reason=f.text[:200])

@@ -16,13 +16,21 @@ are applied inside the child before the task code starts:
    reachable, also for grandchildren. With Landlock ABI >= 4 TCP connect/bind
    is denied as well;
 3. a Python audit hook that refuses to open or list files outside the jail and
-   the interpreter directories and refuses network connections. Without
-   Landlock it additionally refuses to start processes and to load ``ctypes``,
-   because those would escape an in-process hook.
+   the interpreter directories and refuses network connections made through
+   Python's ``socket`` module. Without Landlock it additionally refuses to start
+   processes and to load ``ctypes``, because those would escape an in-process hook.
 
 Layer 3 alone is a guard against ordinary programs, not a security boundary
 against deliberately hostile code; layer 2 is enforced by the kernel. The
 active mode is printed by ``--probe`` and recorded in the run trace.
+
+Known limit, measured with ``tests/net_isolation_probe.py`` on Landlock ABI 1
+(kernel 5.15): the file system is confined by the kernel, the network is not.
+The hook stops ``socket.connect`` in the first Python process only; a raw
+``socket()/connect()`` through ctypes, a nested ``python`` started with
+``subprocess`` and ``bash /dev/tcp`` did connect to a local listener. Only with
+Landlock ABI >= 4 (kernel >= 6.7) TCP is denied by the kernel. The child has no
+proxy key either way (scrubbed environment, no access to ``/proc`` or ``/app``).
 
 This file must stay free of imports from the rest of the package: it is
 executed as a plain script inside the child.

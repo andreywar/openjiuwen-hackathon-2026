@@ -129,9 +129,11 @@ cat > "$T/fallback_0002/task.json" <<'JSON'
 JSON
 echo "some notes" > "$T/fallback_0002/notes.txt"
 chmod -R a+rwX "$T"
-LLM_BASE_URL="http://mock-$RUN_ID:8000/v1" LLM_API_KEY="local-mock-key" HARNESS_MUTATION_REPAIR=0 \
+LLM_BASE_URL="http://mock-$RUN_ID:8000/v1" LLM_API_KEY="local-mock-key" HARNESS_MUTATION_REPAIR=0 BUDGET=25000 \
 run_harness "$T" "$AUDIT_RUN/results_mock" "$AUDIT_RUN/run_mock.log" --network "$NET" \
-  -e LLM_BASE_URL -e LLM_API_KEY -e HARNESS_MUTATION_REPAIR
+  -e LLM_BASE_URL -e LLM_API_KEY -e HARNESS_MUTATION_REPAIR -e BUDGET
+grep -E "budget:" "$AUDIT_RUN/run_mock.log" | cut -c1-200
+grep -q "budget: 25000 weighted tokens, source: BUDGET" "$AUDIT_RUN/run_mock.log"; verdict $? "BUDGET from the environment is the limit of the run (25000, not tasks x 1000)"
 echo "container exit code: $?"
 grep -E "SUMMARY|TOKENS|fallback_000|coding_000" "$AUDIT_RUN/run_mock.log" | cut -c1-220
 TR="$AUDIT_RUN/results_mock/trace.jsonl"
@@ -157,6 +159,27 @@ verdict $? "mock: coding patches installed through the LLM tier, tests green, sp
 [ "$(cat "$T/fallback_0001/answer.txt" 2>/dev/null)" = 42 ] && [ "$(cat "$T/fallback_0002/answer.txt" 2>/dev/null)" = 42 ]
 verdict $? "mock: generic fallback loop wrote its answers (with and without workspace/)"
 docker logs "mock-$RUN_ID" 2>&1 | tail -2
+
+note "E2. BUDGET=0 and an unusable BUDGET: no paid call, free answers still written"
+for B in 0 lots; do
+  T="$(fresh_tasks "tasks_budget_$B")"
+  mkdir -p "$T/fallback_0001/workspace"
+  cp "$AUDIT_RUN/tasks_mock/fallback_0001/task.json" "$T/fallback_0001/task.json"
+  chmod -R a+rwX "$T"
+  LLM_BASE_URL="http://mock-$RUN_ID:8000/v1" LLM_API_KEY="local-mock-key" HARNESS_MUTATION_REPAIR=0 BUDGET="$B" \
+  run_harness "$T" "$AUDIT_RUN/results_budget_$B" "$AUDIT_RUN/run_budget_$B.log" --network "$NET" \
+    -e LLM_BASE_URL -e LLM_API_KEY -e HARNESS_MUTATION_REPAIR -e BUDGET
+  grep -E "budget|SUMMARY|TOKENS" "$AUDIT_RUN/run_budget_$B.log" | cut -c1-220
+  CALLS="$(grep -c '"event": "llm_call"' "$AUDIT_RUN/results_budget_$B/trace.jsonl")"
+  [ "$CALLS" = 0 ] && grep -q "answered=6/9" "$AUDIT_RUN/run_budget_$B.log"
+  verdict $? "BUDGET=$B: 0 LLM calls, the 6 zero-token answers are written, 3 LLM tasks left unanswered"
+done
+
+note "E3. network reach of task code (information: see README, the kernel restricts TCP only from Landlock ABI 4)"
+docker run --rm --name "verify-$RUN_ID" --network none "${SEC[@]}" -v "$TOOLS:/t:ro" \
+  --workdir /tmp --entrypoint python "$CANDIDATE_IMAGE" /t/net_isolation_probe.py > "$AUDIT_RUN/net_probe.log" 2>&1
+echo "probe exit code: $? (0 = the control connection worked, verdicts are below)"
+grep "NET_PROBE" "$AUDIT_RUN/net_probe.log" | cut -c1-330
 
 note "F. proxy faults through the installed openJiuwen (local scripted server, no network)"
 docker run --rm --name "verify-$RUN_ID" --network none "${SEC[@]}" -v "$TOOLS:/t:ro" \

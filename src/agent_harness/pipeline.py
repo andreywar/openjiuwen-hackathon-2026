@@ -154,6 +154,7 @@ async def _paid_one(st: TaskState, llm: LLMClient, settings: Settings, trace: Tr
                     deadline: float) -> None:
     async with sem:
         task = st.task
+        llm.waiting_tasks = max(0, llm.waiting_tasks - 1)  # this task now gets its first chance
         if time.monotonic() > deadline - 30:
             st.reason = "deadline reached"
             return
@@ -203,12 +204,20 @@ def run(tasks_dir: str, settings: Optional[Settings] = None, trace_path: Optiona
     log.info("tasks found: %d in %s", len(tasks), tasks_dir)
     states = [TaskState(t) for t in tasks]
     result.states = states
-    ledger = Ledger(settings.resolve_budget(len(tasks)), settings.budget_soft_fraction)
+    budget_total, budget_source, budget_problem = settings.budget_info(len(tasks))
+    ledger = Ledger(budget_total, settings.budget_soft_fraction)
     result.ledger = ledger
+    paid_allowed = settings.llm_configured and budget_total > 0
+    log.info("budget: %g weighted tokens, source: %s (soft limit %g)", budget_total, budget_source, ledger.soft_limit)
+    if budget_problem:
+        log.error("%s; the zero-token solvers still run", budget_problem)
+    elif budget_total <= 0:
+        log.warning("the budget is 0: no paid LLM calls will be made; the zero-token solvers still run")
     isolation = sandbox.isolation_mode()
     log.info("child process isolation: %s", isolation)
     trace.event("-", "run_start", tasks=len(tasks), budget=ledger.total, soft_limit=ledger.soft_limit,
-                budget_source="TOKEN_BUDGET" if settings.budget_total > 0 else "default per-task assumption",
+                budget_source=budget_source, budget_problem=budget_problem, paid_allowed=paid_allowed,
+                task_cap=settings.task_token_cap, task_cap_explicit=settings.task_cap_explicit,
                 llm_configured=settings.llm_configured, mutation_repair=settings.enable_mutation_repair,
                 isolation=isolation, model_fast=settings.model_fast, model_strong=settings.model_strong)
     if not tasks:
@@ -226,7 +235,7 @@ def run(tasks_dir: str, settings: Optional[Settings] = None, trace_path: Optiona
 
     # ---- phase 1: zero tokens --------------------------------------------
     free_deadline = None
-    if settings.llm_configured:  # leave room for the paid tier
+    if paid_allowed:  # leave room for the paid tier
         free_deadline = t_start + settings.deadline_s * max(0.1, min(1.0, settings.free_phase_fraction))
     phase_free(states, settings, trace, deadline, free_deadline)
     free_solved = sum(1 for s in states if s.status == "solved")
@@ -248,8 +257,15 @@ def run(tasks_dir: str, settings: Optional[Settings] = None, trace_path: Optiona
             for st in queue:
                 st.reason = (st.reason + " | " if st.reason else "") + "LLM not configured"
             log.warning("%d task(s) need the LLM but LLM_BASE_URL / LLM_API_KEY are not set", len(queue))
+        elif not paid_allowed:
+            why = budget_problem or "the budget is 0"
+            for st in queue:
+                st.reason = (st.reason + " | " if st.reason else "") + "no paid calls: " + why
+                trace.event(st.task.task_id, "skipped", reason="no paid calls: " + why)
+            log.warning("%d task(s) need the LLM but paid calls are not allowed: %s", len(queue), why)
         else:
             llm = LLMClient(settings, ledger, trace, deadline)
+            llm.waiting_tasks = len(queue)
             if not preload_openjiuwen():
                 llm._oj_ok = False  # plain HTTP transport only
             result.llm_used = True
